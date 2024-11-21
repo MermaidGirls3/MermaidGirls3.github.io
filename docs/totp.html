@@ -48,7 +48,7 @@
 <body>
   <h1>TOTP Generator</h1>
   <p>Enter your otpauth URI below:</p>
-  <input type="text" id="otpauth-uri" placeholder="otpauth://totp/[ServiceName]:[Account]?secret=[Secret]&issuer=[Issuer]">
+  <input type="text" id="otpauth-uri" placeholder="otpauth://totp/[issuer]:[accountname]?secret=[secret]&issuer=[issuer]&algorithm=[algorithm]&digits=[digits]&period=[period]">
   <p>Generated TOTP:</p>
   <div id="totp-display">-</div>
   <button id="copy-button" disabled>Copy to Clipboard</button>
@@ -58,20 +58,28 @@
   <script>
     function parseOtpAuthUri(uri) {
       try {
-        const url = new URL(uri);
+        const url = new URL(decodeURIComponent(uri));
         // Validate protocol and hostname
         if (url.protocol !== 'otpauth:' || url.hostname !== 'totp') {
           throw new Error('Invalid URI: must start with "otpauth://totp/"');
         }
-        const [service, account] = url.pathname.split(':');
+        const [issuerPath, accountname] = url.pathname.split(':');
+        const issuer = url.searchParams.get('issuer') ?? issuerPath;
         const secret = url.searchParams.get('secret');
-        const issuer = url.searchParams.get('issuer');
+        const algorithm = {
+          SHA512: 'SHA-512',
+          SHA384: 'SHA-384',
+          SHA256: 'SHA-256',
+          SHA1: 'SHA-1',
+        }[url.searchParams.get('algorithm')] || 'SHA-1';
+        const digits = url.searchParams.get('digits') ?? 6;
+        const period = url.searchParams.get('period') ?? 30;
 
         if (!secret) {
           throw new Error('Missing "secret" parameter');
         }
 
-        return { secret, service, account, issuer };
+        return { secret, accountname, issuer, algorithm, digits, period };
       } catch (error) {
         console.error('Error parsing URI:', error.message);
         return null;
@@ -98,10 +106,9 @@
       return hex;
     }
 
-    async function generateTOTP(secret, timeStep = 30, length = 6) {
+    async function generateTOTP(epoch, secret, algorithm, period, digits) {
       const key = base32ToHex(secret);
-      const epoch = Math.floor(Date.now() / 1000);
-      const time = Math.floor(epoch / timeStep).toString(16).padStart(16, '0');
+      const time = Math.floor(epoch / period).toString(16).padStart(16, '0');
 
       const cryptoKey = new Uint8Array(
         key.match(/.{1,2}/g).map(byte => parseInt(byte, 16))
@@ -112,7 +119,7 @@
       );
 
       const keyObj = await crypto.subtle.importKey(
-        'raw', cryptoKey, { name: 'HMAC', hash: 'SHA-1' }, false, ['sign']
+        'raw', cryptoKey, { name: 'HMAC', hash: algorithm }, false, ['sign']
       );
       const signature = await crypto.subtle.sign('HMAC', keyObj, timeBuffer);
       const hash = new Uint8Array(signature);
@@ -121,11 +128,12 @@
              ((hash[offset + 1] & 0xff) << 16) |
              ((hash[offset + 2] & 0xff) << 8) |
              (hash[offset + 3] & 0xff);
-      return (code % 1_000_000).toString().padStart(length, '0');
+      return code.toString().slice(-1 * digits);
     }
 
     function formatTOTP(totp) {
-      return `${totp.slice(0, 3)} ${totp.slice(3)}`;
+      const middle = Math.ceil(totp.length / 2);
+      return `${totp.slice(0, middle)} ${totp.slice(middle)}`;
     }
 
     function updateTOTP() {
@@ -138,44 +146,36 @@
       if (!uri) {
         totpDisplay.textContent = '-';
         timerDisplay.textContent = '-';
+        timerDisplay.style.color = '#555';
         copyButton.disabled = true;
-        return false;
+        return;
       }
 
       const parsed = parseOtpAuthUri(uri);
       if (parsed === null) {
         totpDisplay.textContent = 'Invalid URI format';
+        timerDisplay.textContent = '-';
+        timerDisplay.style.color = '#555';
         copyButton.disabled = true;
-        return false;
+        return;
       }
 
-      generateTOTP(parsed.secret).then(totp => {
+      const epoch = Math.floor(Date.now() / 1000);
+      const remaining = parsed.period - (epoch % parsed.period);
+
+      timerDisplay.textContent = `${remaining}s`;
+      timerDisplay.style.color = remaining <= 7 ? 'red' : '#555';
+
+      generateTOTP(epoch, parsed.secret, parsed.algorithm, parsed.period, parsed.digits).then(totp => {
         totpDisplay.textContent = formatTOTP(totp);
         copyButton.disabled = false;
         copyButton.setAttribute('data-totp', totp);
       }).catch(error => {
         totpDisplay.textContent = 'Error';
+        timerDisplay.textContent = '-';
+        timerDisplay.style.color = '#555';
         console.error('Error generating TOTP:', error);
       });
-      return true;
-    }
-
-    function updateCountdown() {
-      const uriInput = document.getElementById('otpauth-uri');
-      const timerDisplay = document.getElementById('timer-display');
-
-      const uri = uriInput.value.trim();
-      if (!uri) {
-        timerDisplay.textContent = '-';
-        return;
-      }
-
-      const epoch = Math.floor(Date.now() / 1000);
-      const timeStep = 30; // Standard TOTP time step
-      const remaining = timeStep - (epoch % timeStep);
-
-      timerDisplay.textContent = `${remaining}s`;
-      timerDisplay.style.color = remaining <= 7 ? 'red' : '#555';
     }
 
     function copyToClipboard() {
@@ -198,15 +198,8 @@
       }, 2000);
     }
 
-    function loop() {
-      const uriValid = updateTOTP();
-      if (uriValid) {
-        updateCountdown();
-      }
-    }
-
     function main() {
-      setInterval(loop, 1000);
+      setInterval(() => updateTOTP(), 1000);
       document.getElementById('copy-button').addEventListener('click', () => copyToClipboard());
     }
 
